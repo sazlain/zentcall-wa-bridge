@@ -287,15 +287,27 @@ async function processMessage(
 
   let remote = jidToPhone(remoteJid)
 
-  // Resolver LID → teléfono real si el JID es un Linked Identity (privacidad avanzada)
+  // Resolver LID → teléfono real si el JID es un Linked Identity (privacidad avanzada).
+  // contacts.upsert puede llegar ligeramente DESPUÉS de messages.upsert (race condition),
+  // así que reintentamos hasta 5 veces con 200 ms de espera entre intentos (1 s total).
   if (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter')) {
-    const map = lidToPhone.get(adminId)
-    if (map?.has(remote)) {
-      const resolved = map.get(remote)!
-      logger.info({ adminId, lid: remote, phone: resolved }, 'Resolved LID to real phone')
+    const MAX_RETRIES = 5
+    const DELAY_MS    = 200
+    let resolved: string | undefined
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      resolved = lidToPhone.get(adminId)?.get(remote)
+      if (resolved) break
+      if (attempt < MAX_RETRIES - 1) {
+        await new Promise(r => setTimeout(r, DELAY_MS))
+      }
+    }
+
+    if (resolved) {
+      logger.info({ adminId, lid: remote, phone: resolved, attempt: 'ok' }, 'Resolved LID to real phone')
       remote = resolved
     } else {
-      logger.warn({ adminId, jid: remoteJid, lid: remote }, 'LID not resolved — contact map empty, message may not match lead')
+      logger.warn({ adminId, jid: remoteJid, lid: remote }, 'LID not resolved after retries — forwarding LID as-is')
     }
   }
 
