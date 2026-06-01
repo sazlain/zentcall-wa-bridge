@@ -13,7 +13,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as QRCode from 'qrcode'
 
-const logger = pino({ level: process.env.LOG_LEVEL ?? 'silent' })
+const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
 const BACKEND_URL  = process.env.BACKEND_URL  ?? 'http://localhost:8080'
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET ?? 'change-me'
@@ -179,25 +179,45 @@ export async function startSession(adminId: number): Promise<void> {
   // ── Actualización de credenciales ──────────────────────────────────────────
   sock.ev.on('creds.update', saveCreds)
 
-  /**
-   * contacts.upsert — Baileys envía actualizaciones de contactos cuando recibe
-   * mensajes de usuarios con privacidad avanzada (LID). Cada contacto puede
-   * tener `id` como JID real y `lid` como el identificador opaco, o viceversa.
-   * Construimos el mapa en ambas direcciones para máxima cobertura.
-   */
-  sock.ev.on('contacts.upsert', (contactList) => {
+  /** Procesa un array de contactos y actualiza el mapa LID↔teléfono. */
+  function indexContacts(contactList: any[]): void {
+    let changed = false
     for (const c of contactList) {
       if (!c.id) continue
       const rawId  = c.id.replace(/@.+/, '').replace(/:.*/, '')
-      if ((c as any).lid) {
-        const rawLid = String((c as any).lid).replace(/@.+/, '').replace(/:.*/, '')
-        if (rawId && rawLid && rawId !== rawLid) {
-          contacts.set(rawLid, rawId)   // LID → teléfono real
-          contacts.set(rawId,  rawLid)  // inverso (por si acaso)
-          logger.info({ adminId, lid: rawLid, phone: rawId }, 'Contact LID mapped')
-          saveLidMap(adminId, contacts) // persistir a disco
+      // LID puede venir en c.lid (campo propio) o cuando c.id termina en @lid
+      const lidRaw  = (c as any).lid
+        ? String((c as any).lid).replace(/@.+/, '').replace(/:.*/, '')
+        : c.id.endsWith('@lid') ? rawId : null
+
+      const phoneRaw = (c as any).lid
+        ? rawId
+        : (c as any).phone ?? null
+
+      if (lidRaw && phoneRaw && lidRaw !== phoneRaw) {
+        if (!contacts.has(lidRaw) || contacts.get(lidRaw) !== phoneRaw) {
+          contacts.set(lidRaw,   phoneRaw)  // LID → teléfono real
+          contacts.set(phoneRaw, lidRaw)    // inverso
+          logger.info({ adminId, lid: lidRaw, phone: phoneRaw }, 'LID mapped')
+          changed = true
         }
       }
+    }
+    if (changed) saveLidMap(adminId, contacts)
+  }
+
+  /**
+   * contacts.upsert — actualizaciones individuales de contactos.
+   * contacts.update — cambios en contactos existentes.
+   * messaging-history.set — sync inicial: contiene la lista completa de contactos
+   *   con sus LIDs; es la fuente más fiable al reconectar.
+   */
+  sock.ev.on('contacts.upsert',  indexContacts)
+  sock.ev.on('contacts.update',  indexContacts)
+  sock.ev.on('messaging-history.set', ({ contacts: histContacts }) => {
+    if (histContacts?.length) {
+      logger.info({ adminId, count: histContacts.length }, 'Indexing contacts from history sync')
+      indexContacts(histContacts)
     }
   })
 
