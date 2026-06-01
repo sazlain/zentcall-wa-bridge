@@ -37,6 +37,7 @@ const sessions = new Map<number, SessionState>()
  * Mapa por sesión: LID (sin @lid) → número de teléfono real (sin @s.whatsapp.net).
  * WhatsApp con privacidad avanzada oculta el número real en el JID del remitente
  * y usa un LID (Linked Identity). Baileys notifica el mapeo via contacts.upsert.
+ * El mapa se persiste a disco (lid-map.json) para sobrevivir reinicios.
  */
 const lidToPhone = new Map<number, Map<string, string>>()
 
@@ -44,6 +45,30 @@ const lidToPhone = new Map<number, Map<string, string>>()
 
 function sessionDir(adminId: number): string {
   return path.join(SESSIONS_DIR, String(adminId))
+}
+
+function lidMapFile(adminId: number): string {
+  return path.join(sessionDir(adminId), 'lid-map.json')
+}
+
+/** Carga el mapa LID→teléfono persistido en disco al iniciar la sesión. */
+function loadLidMap(adminId: number): Map<string, string> {
+  const file = lidMapFile(adminId)
+  if (fs.existsSync(file)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as Record<string, string>
+      return new Map(Object.entries(raw))
+    } catch { /* ignorar JSON corrupto */ }
+  }
+  return new Map()
+}
+
+/** Persiste el mapa LID→teléfono a disco de forma asíncrona. */
+function saveLidMap(adminId: number, map: Map<string, string>): void {
+  try {
+    const obj = Object.fromEntries(map)
+    fs.writeFileSync(lidMapFile(adminId), JSON.stringify(obj), 'utf-8')
+  } catch { /* ignorar errores de escritura */ }
 }
 
 function getOrCreate(adminId: number): SessionState {
@@ -145,9 +170,9 @@ export async function startSession(adminId: number): Promise<void> {
 
   state.socket = sock
 
-  // ── Mapa LID → teléfono para esta sesión ──────────────────────────────────
+  // ── Mapa LID → teléfono para esta sesión (cargado desde disco) ───────────
   if (!lidToPhone.has(adminId)) {
-    lidToPhone.set(adminId, new Map())
+    lidToPhone.set(adminId, loadLidMap(adminId))
   }
   const contacts = lidToPhone.get(adminId)!
 
@@ -170,6 +195,7 @@ export async function startSession(adminId: number): Promise<void> {
           contacts.set(rawLid, rawId)   // LID → teléfono real
           contacts.set(rawId,  rawLid)  // inverso (por si acaso)
           logger.info({ adminId, lid: rawLid, phone: rawId }, 'Contact LID mapped')
+          saveLidMap(adminId, contacts) // persistir a disco
         }
       }
     }
@@ -298,6 +324,7 @@ export async function stopSession(adminId: number): Promise<void> {
   // Borrar archivos de sesión
   fs.rmSync(sessionDir(adminId), { recursive: true, force: true })
   sessions.delete(adminId)
+  lidToPhone.delete(adminId)
   await notifyStatus(adminId, 'disconnected', null)
 }
 
