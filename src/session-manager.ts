@@ -33,6 +33,13 @@ interface SessionState {
 
 const sessions = new Map<number, SessionState>()
 
+/**
+ * Mapa por sesión: LID (sin @lid) → número de teléfono real (sin @s.whatsapp.net).
+ * WhatsApp con privacidad avanzada oculta el número real en el JID del remitente
+ * y usa un LID (Linked Identity). Baileys notifica el mapeo via contacts.upsert.
+ */
+const lidToPhone = new Map<number, Map<string, string>>()
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function sessionDir(adminId: number): string {
@@ -138,8 +145,35 @@ export async function startSession(adminId: number): Promise<void> {
 
   state.socket = sock
 
+  // ── Mapa LID → teléfono para esta sesión ──────────────────────────────────
+  if (!lidToPhone.has(adminId)) {
+    lidToPhone.set(adminId, new Map())
+  }
+  const contacts = lidToPhone.get(adminId)!
+
   // ── Actualización de credenciales ──────────────────────────────────────────
   sock.ev.on('creds.update', saveCreds)
+
+  /**
+   * contacts.upsert — Baileys envía actualizaciones de contactos cuando recibe
+   * mensajes de usuarios con privacidad avanzada (LID). Cada contacto puede
+   * tener `id` como JID real y `lid` como el identificador opaco, o viceversa.
+   * Construimos el mapa en ambas direcciones para máxima cobertura.
+   */
+  sock.ev.on('contacts.upsert', (contactList) => {
+    for (const c of contactList) {
+      if (!c.id) continue
+      const rawId  = c.id.replace(/@.+/, '').replace(/:.*/, '')
+      if ((c as any).lid) {
+        const rawLid = String((c as any).lid).replace(/@.+/, '').replace(/:.*/, '')
+        if (rawId && rawLid && rawId !== rawLid) {
+          contacts.set(rawLid, rawId)   // LID → teléfono real
+          contacts.set(rawId,  rawLid)  // inverso (por si acaso)
+          logger.info({ adminId, lid: rawLid, phone: rawId }, 'Contact LID mapped')
+        }
+      }
+    }
+  })
 
   // ── Estado de la conexión ──────────────────────────────────────────────────
   sock.ev.on('connection.update', async (update) => {
@@ -218,13 +252,26 @@ async function processMessage(
   const wamid     = key.id ?? ''
   const remoteJid = key.remoteJid ?? ''
   const fromMe    = key.fromMe ?? false
-  const remote    = jidToPhone(remoteJid)
   const timestamp = typeof messageTimestamp === 'number'
     ? messageTimestamp
     : Number(messageTimestamp ?? Math.floor(Date.now() / 1000))
 
   // Ignorar mensajes de grupos y broadcast
   if (remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') return
+
+  let remote = jidToPhone(remoteJid)
+
+  // Resolver LID → teléfono real si el JID es un Linked Identity (privacidad avanzada)
+  if (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter')) {
+    const map = lidToPhone.get(adminId)
+    if (map?.has(remote)) {
+      const resolved = map.get(remote)!
+      logger.info({ adminId, lid: remote, phone: resolved }, 'Resolved LID to real phone')
+      remote = resolved
+    } else {
+      logger.warn({ adminId, jid: remoteJid, lid: remote }, 'LID not resolved — contact map empty, message may not match lead')
+    }
+  }
 
   const fromPhone = fromMe ? myPhone : remote
   const toPhone   = fromMe ? remote  : myPhone
