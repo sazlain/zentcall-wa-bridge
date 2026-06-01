@@ -41,6 +41,13 @@ const sessions = new Map<number, SessionState>()
  */
 const lidToPhone = new Map<number, Map<string, string>>()
 
+/**
+ * Mapa temporal: wamid → toPhone (sin símbolos).
+ * Permite resolver el LID cuando llega el echo de un mensaje saliente:
+ * el echo puede tener remoteJid=LID@lid pero el wamid coincide con el envío.
+ */
+const pendingOutbound = new Map<number, Map<string, string>>() // adminId → (wamid → toPhone)
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function sessionDir(adminId: number): string {
@@ -307,10 +314,30 @@ async function processMessage(
 
   let remote = jidToPhone(remoteJid)
 
-  // Resolver LID → teléfono real si el JID es un Linked Identity (privacidad avanzada).
+  // ── Captura de LID desde echo saliente ───────────────────────────────────
+  // Cuando enviamos a "3157665297@s.whatsapp.net", el echo puede llegar con
+  // remoteJid="187106055983173@lid". El wamid coincide con el envío registrado
+  // en pendingOutbound, así capturamos el mapping LID→teléfono automáticamente.
+  if (fromMe && (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter'))) {
+    const sentPhone = pendingOutbound.get(adminId)?.get(wamid)
+    if (sentPhone) {
+      const lid = remote
+      const map = lidToPhone.get(adminId) ?? new Map()
+      if (!map.has(lid)) {
+        map.set(lid, sentPhone)
+        map.set(sentPhone, lid)
+        lidToPhone.set(adminId, map)
+        saveLidMap(adminId, map)
+        logger.info({ adminId, lid, phone: sentPhone }, 'LID captured from outbound echo — map updated')
+      }
+      remote = sentPhone
+    }
+  }
+
+  // ── Resolver LID → teléfono real (mensajes entrantes) ────────────────────
   // contacts.upsert puede llegar ligeramente DESPUÉS de messages.upsert (race condition),
   // así que reintentamos hasta 5 veces con 200 ms de espera entre intentos (1 s total).
-  if (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter')) {
+  if (!fromMe && (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter'))) {
     const MAX_RETRIES = 5
     const DELAY_MS    = 200
     let resolved: string | undefined
@@ -324,7 +351,7 @@ async function processMessage(
     }
 
     if (resolved) {
-      logger.info({ adminId, lid: remote, phone: resolved, attempt: 'ok' }, 'Resolved LID to real phone')
+      logger.info({ adminId, lid: remote, phone: resolved }, 'Resolved LID to real phone')
       remote = resolved
     } else {
       logger.warn({ adminId, jid: remoteJid, lid: remote }, 'LID not resolved after retries — forwarding LID as-is')
@@ -390,9 +417,19 @@ export async function sendTextMessage(
   }
 
   // Formatear JID: "573001234567" → "573001234567@s.whatsapp.net"
-  const jid     = toPhone.replace(/\D/g, '') + '@s.whatsapp.net'
-  const result  = await state.socket.sendMessage(jid, { text })
-  const wamid   = result?.key?.id ?? ''
+  const cleanPhone = toPhone.replace(/\D/g, '')
+  const jid        = cleanPhone + '@s.whatsapp.net'
+  const result     = await state.socket.sendMessage(jid, { text })
+  const wamid      = result?.key?.id ?? ''
+
+  // Registrar wamid → toPhone para capturar el LID cuando llegue el echo saliente.
+  // El echo puede llegar con remoteJid=LID@lid aunque enviamos a @s.whatsapp.net.
+  if (wamid) {
+    if (!pendingOutbound.has(adminId)) pendingOutbound.set(adminId, new Map())
+    pendingOutbound.get(adminId)!.set(wamid, cleanPhone)
+    // Limpiar después de 60s para no acumular indefinidamente
+    setTimeout(() => pendingOutbound.get(adminId)?.delete(wamid), 60_000)
+  }
 
   return { wamid }
 }
