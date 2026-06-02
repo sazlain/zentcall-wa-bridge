@@ -1,0 +1,85 @@
+services:
+  db:
+    image: postgres:15-alpine
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [zentcall-qa]
+
+  app:
+    image: ghcr.io/sazlain/call-monitor:qa
+    env_file: .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_UPLOADS_DIR: /app/uploads
+      APP_BASE_URL: https://qa.app.zentcall.com
+      SERVER_BASE_URL: https://qa.api.zentcall.com
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY}
+      VAPID_SUBJECT: mailto:admin@zentcall.com
+    ports:
+      - "8082:8080"
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks: [zentcall-qa]
+
+  frontend:
+    image: ghcr.io/sazlain/voxio:qa
+    ports:
+      - "3002:80"
+    restart: unless-stopped
+    networks: [zentcall-qa]
+
+  wa-bridge:
+    image: ghcr.io/sazlain/zentcall-wa-bridge:qa
+    env_file: .env
+    environment:
+      BACKEND_URL: http://app:8080
+      BRIDGE_SECRET: ${WA_BRIDGE_SECRET}
+      PORT: "3002"
+      SESSIONS_DIR: /sessions
+    volumes:
+      - wa_sessions:/sessions
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks: [zentcall-qa]
+
+volumes:
+  postgres_data:
+  uploads_data:
+  wa_sessions:
+
+networks:
+  zentcall-qa:
+    driver: bridge
