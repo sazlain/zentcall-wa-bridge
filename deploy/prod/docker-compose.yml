@@ -1,7 +1,7 @@
 services:
   db:
     image: postgres:15-alpine
-    env_file: .env
+    env_file: ./call-monitor/.env
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -18,7 +18,7 @@ services:
 
   app:
     image: ghcr.io/sazlain/call-monitor:main
-    env_file: .env
+    env_file: ./call-monitor/.env
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB}
       SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
@@ -53,7 +53,7 @@ services:
 
   wa-bridge:
     image: ghcr.io/sazlain/zentcall-wa-bridge:main
-    env_file: .env
+    env_file: ./call-monitor/.env
     environment:
       BACKEND_URL: http://app:8080
       BRIDGE_SECRET: ${WA_BRIDGE_SECRET}
