@@ -53,14 +53,14 @@ services:
 
   wa-bridge:
     image: ghcr.io/sazlain/zentcall-wa-bridge:main
-    env_file: ./call-monitor/.env
+    env_file: ./wa-bridge/.env
     environment:
       BACKEND_URL: http://app:8080
       BRIDGE_SECRET: ${WA_BRIDGE_SECRET}
       PORT: "3002"
       SESSIONS_DIR: /sessions
     volumes:
-      - wa_sessions:/sessions
+      - ./wa-bridge/sessions:/sessions
     depends_on:
       app:
         condition: service_healthy
@@ -75,7 +75,6 @@ services:
 volumes:
   postgres_data:
   uploads_data:
-  wa_sessions:
 
 networks:
   zentcall-prod:

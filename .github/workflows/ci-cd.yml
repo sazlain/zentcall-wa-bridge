@@ -131,6 +131,7 @@ jobs:
             set -e
             echo "→ Deploy WA Bridge [develop] en DEV"
             cd /root/dev
+            mkdir -p wa-bridge/sessions
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
             docker compose pull wa-bridge
             docker compose up -d --force-recreate --no-deps wa-bridge
@@ -176,6 +177,7 @@ jobs:
             set -e
             echo "→ Deploy WA Bridge [qa] en QA"
             cd /root/qa
+            mkdir -p wa-bridge/sessions
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
             docker compose pull wa-bridge
             docker compose up -d --force-recreate --no-deps wa-bridge
@@ -221,6 +223,7 @@ jobs:
             set -e
             echo "→ Deploy WA Bridge [main] en PRODUCCIÓN"
             cd /root/prod
+            mkdir -p wa-bridge/sessions
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
             docker compose pull wa-bridge
             docker compose up -d --force-recreate --no-deps wa-bridge
