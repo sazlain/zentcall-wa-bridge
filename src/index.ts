@@ -6,6 +6,7 @@ import {
   getStatus,
   getQrBase64,
   sendTextMessage,
+  sendMediaMessage,
   restorePersistedSessions,
 } from './session-manager'
 
@@ -89,6 +90,28 @@ app.post('/sessions/:adminId/send', async (req: Request, res: Response) => {
 
   try {
     const result = await sendTextMessage(adminId, toPhone, body)
+    return res.json(result)
+  } catch (err) {
+    const msg = String(err)
+    const code = msg.includes('No hay sesión') ? 503 : 500
+    return res.status(code).json({ error: msg })
+  }
+})
+
+/** POST /sessions/:adminId/send-media — Envía una imagen, video o documento */
+app.post('/sessions/:adminId/send-media', async (req: Request, res: Response) => {
+  const adminId = parseInt(req.params.adminId, 10)
+  if (isNaN(adminId)) return res.status(400).json({ error: 'adminId inválido' })
+
+  const { toPhone, mediaType, mediaBase64, mimetype, caption } =
+    req.body as { toPhone?: string; mediaType?: string; mediaBase64?: string; mimetype?: string; caption?: string }
+
+  if (!toPhone || !mediaType || !mediaBase64 || !mimetype) {
+    return res.status(400).json({ error: 'Se requieren toPhone, mediaType, mediaBase64 y mimetype' })
+  }
+
+  try {
+    const result = await sendMediaMessage(adminId, toPhone, mediaType, mediaBase64, mimetype, caption)
     return res.json(result)
   } catch (err) {
     const msg = String(err)

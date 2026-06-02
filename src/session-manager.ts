@@ -458,6 +458,53 @@ export async function sendTextMessage(
   return { wamid }
 }
 
+export async function sendMediaMessage(
+  adminId:      number,
+  toPhone:      string,
+  mediaType:    string,
+  mediaBase64:  string,
+  mimetype:     string,
+  caption?:     string,
+): Promise<{ wamid: string }> {
+  const state = sessions.get(adminId)
+  if (!state?.socket || state.status !== 'connected') {
+    throw new Error(`No hay sesión activa para adminId=${adminId}`)
+  }
+
+  const cleanPhone = toPhone.replace(/\D/g, '')
+
+  const map  = lidToPhone.get(adminId)
+  const lid  = map?.get(cleanPhone)
+    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
+    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
+
+  const useLid = lid && lid !== cleanPhone && lid.length >= 13
+  const jid    = useLid ? `${lid}@lid` : `${cleanPhone}@s.whatsapp.net`
+
+  logger.info({ adminId, toPhone: cleanPhone, lid: lid ?? null, jid, mediaType }, 'Sending WA media')
+
+  const buf = Buffer.from(mediaBase64, 'base64')
+  let content: any
+  if (mediaType.startsWith('image/') || mediaType === 'image') {
+    content = { image: buf, mimetype, caption: caption ?? '' }
+  } else if (mediaType.startsWith('video/') || mediaType === 'video') {
+    content = { video: buf, mimetype, caption: caption ?? '' }
+  } else {
+    content = { document: buf, mimetype, caption: caption ?? '', fileName: 'archivo' }
+  }
+
+  const result = await state.socket.sendMessage(jid, content)
+  const wamid  = result?.key?.id ?? ''
+
+  if (wamid) {
+    if (!pendingOutbound.has(adminId)) pendingOutbound.set(adminId, new Map())
+    pendingOutbound.get(adminId)!.set(wamid, cleanPhone)
+    setTimeout(() => pendingOutbound.get(adminId)?.delete(wamid), 60_000)
+  }
+
+  return { wamid }
+}
+
 /** Reconectar sesiones persistidas al arrancar el servicio. */
 export async function restorePersistedSessions(): Promise<void> {
   if (!fs.existsSync(SESSIONS_DIR)) return
