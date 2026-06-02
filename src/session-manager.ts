@@ -5,6 +5,7 @@ import makeWASocket, {
   WAMessage,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadMediaMessage,
   proto,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
@@ -98,6 +99,13 @@ function jidToPhone(jid: string): string {
   return jid.replace(/@.+/, '').replace(/:.*/, '')
 }
 
+interface MediaPayload {
+  mediaType:   string   // "image" | "video" | "document" | "audio"
+  mediaBase64: string
+  mimetype:    string
+  fileName?:   string
+}
+
 /** Notifica a call-monitor sobre un mensaje recibido o enviado. */
 async function forwardMessage(
   adminId:   number,
@@ -107,15 +115,25 @@ async function forwardMessage(
   direction: 'INBOUND' | 'OUTBOUND',
   wamid:     string,
   timestamp: number,
+  media?:    MediaPayload,
 ): Promise<void> {
   try {
+    const payload: Record<string, unknown> = {
+      adminId, fromPhone, toPhone, body, direction, wamid, timestamp,
+    }
+    if (media) {
+      payload.mediaType   = media.mediaType
+      payload.mediaBase64 = media.mediaBase64
+      payload.mimetype    = media.mimetype
+      if (media.fileName) payload.fileName = media.fileName
+    }
     const res = await fetch(`${BACKEND_URL}/api/internal/wa-bridge/message`, {
       method:  'POST',
       headers: {
         'Content-Type':  'application/json',
         'Authorization': `Bearer ${BRIDGE_SECRET}`,
       },
-      body: JSON.stringify({ adminId, fromPhone, toPhone, body, direction, wamid, timestamp }),
+      body: JSON.stringify(payload),
     })
     if (!res.ok) {
       logger.error({ adminId, status: res.status }, 'bridge forward failed')
@@ -123,6 +141,22 @@ async function forwardMessage(
   } catch (err) {
     logger.error({ adminId, err }, 'bridge forward error')
   }
+}
+
+/**
+ * Detecta si el mensaje contiene media y devuelve la info necesaria para descargarlo.
+ * Devuelve null para mensajes sin media (texto, reacciones, stickers ignorados).
+ */
+function detectMediaInfo(message: proto.IMessage): { mediaType: string; mimetype: string; fileName?: string } | null {
+  if (message.imageMessage)    return { mediaType: 'image',    mimetype: message.imageMessage.mimetype    ?? 'image/jpeg' }
+  if (message.videoMessage)    return { mediaType: 'video',    mimetype: message.videoMessage.mimetype    ?? 'video/mp4'  }
+  if (message.audioMessage)    return { mediaType: 'audio',    mimetype: message.audioMessage.mimetype    ?? 'audio/ogg'  }
+  if (message.documentMessage) return {
+    mediaType: 'document',
+    mimetype:  message.documentMessage.mimetype  ?? 'application/octet-stream',
+    fileName:  message.documentMessage.fileName  ?? undefined,
+  }
+  return null
 }
 
 /** Notifica el cambio de estado de la sesión a call-monitor. */
@@ -278,7 +312,7 @@ export async function startSession(adminId: number): Promise<void> {
 
     for (const msg of messages) {
       try {
-        await processMessage(adminId, msg, myPhone)
+        await processMessage(adminId, msg, myPhone, sock)
       } catch (err) {
         logger.error({ adminId, err }, 'Error processing message')
       }
@@ -290,17 +324,25 @@ async function processMessage(
   adminId: number,
   msg: WAMessage,
   myPhone: string,
+  sock: WASocket,
 ): Promise<void> {
   const { key, message, messageTimestamp } = msg
   if (!key || !message) return
 
-  // Extraer texto del mensaje (solo texto plano por ahora)
+  // Extraer texto / caption del mensaje
   const body =
-    message.conversation ??
+    message.conversation              ??
     message.extendedTextMessage?.text ??
+    message.imageMessage?.caption     ??
+    message.videoMessage?.caption     ??
+    message.documentMessage?.caption  ??
     null
 
-  if (!body || body.trim() === '') return // ignorar stickers, imágenes, audio, etc.
+  // Detectar media adjunta
+  const mediaInfo = detectMediaInfo(message)
+
+  // Sin texto ni media → ignorar (stickers, reacciones, ephemeral notices, etc.)
+  if (!body && !mediaInfo) return
 
   const wamid     = key.id ?? ''
   const remoteJid = key.remoteJid ?? ''
@@ -370,7 +412,27 @@ async function processMessage(
   const toPhone   = fromMe ? remote  : myPhone
   const direction = fromMe ? 'OUTBOUND' : 'INBOUND'
 
-  await forwardMessage(adminId, fromPhone, toPhone, body, direction, wamid, timestamp)
+  // Descargar media si existe
+  let media: MediaPayload | undefined
+  if (mediaInfo) {
+    try {
+      const buffer = await downloadMediaMessage(
+        msg, 'buffer', {},
+        { logger, reuploadRequest: sock.updateMediaMessage },
+      ) as Buffer
+      media = {
+        mediaType:   mediaInfo.mediaType,
+        mediaBase64: buffer.toString('base64'),
+        mimetype:    mediaInfo.mimetype,
+        fileName:    mediaInfo.fileName,
+      }
+      logger.info({ adminId, mediaType: mediaInfo.mediaType, size: buffer.length }, 'Media downloaded')
+    } catch (err) {
+      logger.error({ adminId, mediaType: mediaInfo.mediaType, err }, 'Failed to download media — forwarding text only')
+    }
+  }
+
+  await forwardMessage(adminId, fromPhone, toPhone, body ?? '', direction, wamid, timestamp, media)
 }
 
 // ── API pública del manager ───────────────────────────────────────────────────
