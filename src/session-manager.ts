@@ -49,6 +49,13 @@ const lidToPhone = new Map<number, Map<string, string>>()
  */
 const pendingOutbound = new Map<number, Map<string, string>>() // adminId → (wamid → toPhone)
 
+/**
+ * Todos los contactos recibidos desde Baileys (cualquier evento) por sesión.
+ * Clave: JID completo (ej: "573157665297@s.whatsapp.net").
+ * Permite buscar el teléfono real cuando un LID no está en lidToPhone.
+ */
+const allContacts = new Map<number, Map<string, any>>() // adminId → (jid → contact)
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function sessionDir(adminId: number): string {
@@ -211,6 +218,11 @@ export async function startSession(adminId: number): Promise<void> {
 
   state.socket = sock
 
+  // ── Inicializar colección de contactos para esta sesión ──────────────────
+  if (!allContacts.has(adminId)) {
+    allContacts.set(adminId, new Map())
+  }
+
   // ── Mapa LID → teléfono para esta sesión (cargado desde disco) ───────────
   if (!lidToPhone.has(adminId)) {
     lidToPhone.set(adminId, loadLidMap(adminId))
@@ -223,8 +235,13 @@ export async function startSession(adminId: number): Promise<void> {
   /** Procesa un array de contactos y actualiza el mapa LID↔teléfono. */
   function indexContacts(contactList: any[]): void {
     let changed = false
+    const sessionAllContacts = allContacts.get(adminId)!
     for (const c of contactList) {
       if (!c.id) continue
+
+      // Guardar contacto completo para fallback de búsqueda por LID
+      sessionAllContacts.set(c.id, c)
+
       const rawId  = c.id.replace(/@.+/, '').replace(/:.*/, '')
       // LID puede venir en c.lid (campo propio) o cuando c.id termina en @lid
       const lidRaw  = (c as any).lid
@@ -404,7 +421,29 @@ async function processMessage(
       logger.info({ adminId, lid: remote, phone: resolved }, 'Resolved LID to real phone')
       remote = resolved
     } else {
-      logger.warn({ adminId, jid: remoteJid, lid: remote }, 'LID not resolved after retries — forwarding LID as-is')
+      // Fallback: buscar en allContacts un contacto cuyo .lid coincida
+      const sessionAllContacts = allContacts.get(adminId)
+      if (sessionAllContacts) {
+        for (const [jid, contact] of sessionAllContacts) {
+          if (jid.endsWith('@lid') || jid.endsWith('@g.us')) continue
+          const cLid = contact.lid as string | undefined
+          if (cLid && (cLid === remoteJid || cLid.replace(/@.+/, '') === remote)) {
+            resolved = jid.replace(/@.+/, '').replace(/:.*/, '')
+            const cMap = lidToPhone.get(adminId)!
+            cMap.set(remote, resolved)
+            cMap.set(resolved, remote)
+            saveLidMap(adminId, cMap)
+            logger.info({ adminId, lid: remote, phone: resolved }, 'Resolved LID from allContacts fallback')
+            break
+          }
+        }
+      }
+
+      if (resolved) {
+        remote = resolved
+      } else {
+        logger.warn({ adminId, jid: remoteJid, lid: remote }, 'LID not resolved — forwarding LID as-is')
+      }
     }
   }
 
