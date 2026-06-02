@@ -314,24 +314,32 @@ async function processMessage(
 
   let remote = jidToPhone(remoteJid)
 
-  // ── Captura de LID desde echo saliente ───────────────────────────────────
-  // Cuando enviamos a "3157665297@s.whatsapp.net", el echo puede llegar con
-  // remoteJid="187106055983173@lid". El wamid coincide con el envío registrado
-  // en pendingOutbound, así capturamos el mapping LID→teléfono automáticamente.
-  if (fromMe && (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter'))) {
+  // ── Captura de LID desde echo saliente + deduplicación ───────────────────
+  // Cuando enviamos a "573157665297@s.whatsapp.net", el echo llega con
+  // remoteJid="187106055983173@lid" (o el JID real). El wamid coincide con
+  // el envío en pendingOutbound: capturamos el LID y NO reenviamos a
+  // call-monitor (ya guardado por sendViaBridge → evita duplicados en chat).
+  if (fromMe) {
     const sentPhone = pendingOutbound.get(adminId)?.get(wamid)
     if (sentPhone) {
-      const lid = remote
-      const map = lidToPhone.get(adminId) ?? new Map()
-      if (!map.has(lid)) {
-        map.set(lid, sentPhone)
-        map.set(sentPhone, lid)
-        lidToPhone.set(adminId, map)
-        saveLidMap(adminId, map)
-        logger.info({ adminId, lid, phone: sentPhone }, 'LID captured from outbound echo — map updated')
+      // Capturar LID si el echo vino como @lid
+      if (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter')) {
+        const lid = remote
+        const map = lidToPhone.get(adminId) ?? new Map()
+        if (!map.has(lid)) {
+          map.set(lid, sentPhone)
+          map.set(sentPhone, lid)
+          lidToPhone.set(adminId, map)
+          saveLidMap(adminId, map)
+          logger.info({ adminId, lid, phone: sentPhone }, 'LID captured from outbound echo')
+        }
       }
-      remote = sentPhone
+      // El mensaje ya fue guardado por call-monitor al enviar. No reenviar.
+      logger.debug({ adminId, wamid }, 'Echo for bridge-API message — skipping forward (already saved)')
+      return
     }
+    // fromMe=true pero NO está en pendingOutbound → enviado directamente desde
+    // el teléfono (fuera de Zentcall) → sí reenviar para registrar.
   }
 
   // ── Resolver LID → teléfono real (mensajes entrantes) ────────────────────
