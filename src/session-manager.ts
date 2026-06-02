@@ -427,15 +427,22 @@ export async function sendTextMessage(
   const cleanPhone = toPhone.replace(/\D/g, '')
 
   /**
-   * Siempre enviamos al JID de teléfono (@s.whatsapp.net).
-   * Baileys no soporta sesiones E2E salientes a JIDs @lid —
-   * el dominio @lid es routing interno del servidor WA y no tiene
-   * claves de pre-distribución registradas. Usarlo causa el error
-   * permanente "Esperando el mensaje." en el destinatario.
+   * Preferir el LID cuando esté disponible.
+   * Si el contacto recibió con @lid, Baileys tiene la sesión E2E establecida
+   * para ese JID. Enviar al mismo LID usa esa sesión y el mensaje llega.
+   * Fallback a @s.whatsapp.net cuando no hay LID mapeado.
+   *
+   * Búsqueda: exacta primero, luego sufijo nacional (maneja código de país).
    */
-  const jid = `${cleanPhone}@s.whatsapp.net`
+  const map  = lidToPhone.get(adminId)
+  const lid  = map?.get(cleanPhone)
+    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
+    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
 
-  logger.info({ adminId, toPhone: cleanPhone, jid }, 'Sending WA message')
+  const useLid = lid && lid !== cleanPhone && lid.length >= 13
+  const jid    = useLid ? `${lid}@lid` : `${cleanPhone}@s.whatsapp.net`
+
+  logger.info({ adminId, toPhone: cleanPhone, lid: lid ?? null, jid }, 'Sending WA message')
 
   const result = await state.socket.sendMessage(jid, { text })
   const wamid  = result?.key?.id ?? ''
