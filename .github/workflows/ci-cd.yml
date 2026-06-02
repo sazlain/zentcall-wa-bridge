@@ -132,8 +132,8 @@ jobs:
             echo "→ Deploy WA Bridge [develop] en DEV"
             cd /root/dev
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-            docker compose pull bridge
-            docker compose up -d --force-recreate --no-deps bridge
+            docker compose pull wa-bridge
+            docker compose up -d --force-recreate --no-deps wa-bridge
             docker image prune -f
             echo "✅ WA Bridge DEV desplegado: $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -164,8 +164,8 @@ jobs:
             echo "→ Deploy WA Bridge [qa] en QA"
             cd /root/qa
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-            docker compose pull bridge
-            docker compose up -d --force-recreate --no-deps bridge
+            docker compose pull wa-bridge
+            docker compose up -d --force-recreate --no-deps wa-bridge
             docker image prune -f
             echo "✅ WA Bridge QA desplegado: $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -196,7 +196,7 @@ jobs:
             echo "→ Deploy WA Bridge [main] en PRODUCCIÓN"
             cd /root/prod
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-            docker compose pull bridge
-            docker compose up -d --force-recreate --no-deps bridge
+            docker compose pull wa-bridge
+            docker compose up -d --force-recreate --no-deps wa-bridge
             docker image prune -f
             echo "✅ WA Bridge PRODUCCIÓN desplegado: $(date '+%Y-%m-%d %H:%M:%S')"
