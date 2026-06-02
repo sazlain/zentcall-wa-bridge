@@ -424,18 +424,40 @@ export async function sendTextMessage(
     throw new Error(`No hay sesión activa para adminId=${adminId}`)
   }
 
-  // Formatear JID: "573001234567" → "573001234567@s.whatsapp.net"
   const cleanPhone = toPhone.replace(/\D/g, '')
-  const jid        = cleanPhone + '@s.whatsapp.net'
-  const result     = await state.socket.sendMessage(jid, { text })
-  const wamid      = result?.key?.id ?? ''
 
-  // Registrar wamid → toPhone para capturar el LID cuando llegue el echo saliente.
-  // El echo puede llegar con remoteJid=LID@lid aunque enviamos a @s.whatsapp.net.
+  /**
+   * Preferir el LID sobre el JID de teléfono cuando esté disponible.
+   *
+   * Motivo: si el contacto tiene privacidad avanzada de WA, toda la comunicación
+   * previa usó LID@lid. Baileys tiene las claves de sesión E2E para ese LID.
+   * Enviar a <phone>@s.whatsapp.net hace que WA no pueda establecer el canal
+   * cifrado → aparece "Esperando el mensaje. Esto puede tomar tiempo." en el
+   * teléfono del destinatario.
+   *
+   * Búsqueda: exacta primero, luego por sufijo nacional (maneja código de país).
+   * Ej: si el mapa tiene "3157665297 → LID" y enviamos "573157665297",
+   * la búsqueda por sufijo de 10 dígitos lo encuentra.
+   */
+  const map = lidToPhone.get(adminId)
+  const lid = map?.get(cleanPhone)
+    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
+    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
+
+  // Usar el LID solo si parece realmente un LID (≥13 dígitos, distinto al teléfono)
+  const useLid = lid && lid !== cleanPhone && lid.length >= 13
+  const jid    = useLid ? `${lid}@lid` : `${cleanPhone}@s.whatsapp.net`
+
+  logger.info({ adminId, toPhone: cleanPhone, lid: lid ?? null, jid }, 'Sending WA message')
+
+  const result = await state.socket.sendMessage(jid, { text })
+  const wamid  = result?.key?.id ?? ''
+
+  // Registrar wamid → toPhone para deduplicar el echo saliente
+  // y capturar el LID→phone si el echo llega como @lid.
   if (wamid) {
     if (!pendingOutbound.has(adminId)) pendingOutbound.set(adminId, new Map())
     pendingOutbound.get(adminId)!.set(wamid, cleanPhone)
-    // Limpiar después de 60s para no acumular indefinidamente
     setTimeout(() => pendingOutbound.get(adminId)?.delete(wamid), 60_000)
   }
 
