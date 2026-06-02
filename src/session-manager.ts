@@ -427,28 +427,15 @@ export async function sendTextMessage(
   const cleanPhone = toPhone.replace(/\D/g, '')
 
   /**
-   * Preferir el LID sobre el JID de teléfono cuando esté disponible.
-   *
-   * Motivo: si el contacto tiene privacidad avanzada de WA, toda la comunicación
-   * previa usó LID@lid. Baileys tiene las claves de sesión E2E para ese LID.
-   * Enviar a <phone>@s.whatsapp.net hace que WA no pueda establecer el canal
-   * cifrado → aparece "Esperando el mensaje. Esto puede tomar tiempo." en el
-   * teléfono del destinatario.
-   *
-   * Búsqueda: exacta primero, luego por sufijo nacional (maneja código de país).
-   * Ej: si el mapa tiene "3157665297 → LID" y enviamos "573157665297",
-   * la búsqueda por sufijo de 10 dígitos lo encuentra.
+   * Siempre enviamos al JID de teléfono (@s.whatsapp.net).
+   * Baileys no soporta sesiones E2E salientes a JIDs @lid —
+   * el dominio @lid es routing interno del servidor WA y no tiene
+   * claves de pre-distribución registradas. Usarlo causa el error
+   * permanente "Esperando el mensaje." en el destinatario.
    */
-  const map = lidToPhone.get(adminId)
-  const lid = map?.get(cleanPhone)
-    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
-    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
+  const jid = `${cleanPhone}@s.whatsapp.net`
 
-  // Usar el LID solo si parece realmente un LID (≥13 dígitos, distinto al teléfono)
-  const useLid = lid && lid !== cleanPhone && lid.length >= 13
-  const jid    = useLid ? `${lid}@lid` : `${cleanPhone}@s.whatsapp.net`
-
-  logger.info({ adminId, toPhone: cleanPhone, lid: lid ?? null, jid }, 'Sending WA message')
+  logger.info({ adminId, toPhone: cleanPhone, jid }, 'Sending WA message')
 
   const result = await state.socket.sendMessage(jid, { text })
   const wamid  = result?.key?.id ?? ''
