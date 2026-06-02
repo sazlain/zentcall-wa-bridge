@@ -1,0 +1,202 @@
+name: WA Bridge CI/CD
+
+on:
+  push:
+    branches: [main, qa, develop]
+  pull_request:
+    branches: [main, qa, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Entorno destino del deploy manual'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, qa, prod]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/zentcall-wa-bridge
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # JOB 1: Type check + Build — siempre (PR, push y dispatch)
+  # ──────────────────────────────────────────────────────────────
+  build:
+    name: Type check & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 2: Build & Push Docker — solo en push/dispatch (no PRs)
+  # ──────────────────────────────────────────────────────────────
+  docker:
+    name: Build & Push Docker image
+    needs: build
+    if: >
+      needs.build.result == 'success' &&
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolver tag de imagen
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            case "${{ inputs.environment }}" in
+              prod) echo "branch=main"    >> $GITHUB_OUTPUT ;;
+              qa)   echo "branch=qa"      >> $GITHUB_OUTPUT ;;
+              *)    echo "branch=develop" >> $GITHUB_OUTPUT ;;
+            esac
+          else
+            echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.tag.outputs.branch }}
+            type=sha,prefix=${{ steps.tag.outputs.branch }}-,format=short
+          labels: |
+            org.opencontainers.image.title=ZentCall WA Bridge
+            org.opencontainers.image.description=WhatsApp Web bridge para ZentCall via Baileys
+
+      - name: Build & Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 3a: Deploy → DEV  (rama develop)
+  # ──────────────────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy → DEV
+    needs: docker
+    if: >
+      needs.docker.result == 'success' &&
+      (
+        (github.event_name == 'push' && github.ref_name == 'develop') ||
+        (github.event_name == 'workflow_dispatch' && inputs.environment == 'dev')
+      )
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            echo "→ Deploy WA Bridge [develop] en DEV"
+            cd /root/dev
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker compose pull wa-bridge
+            docker compose up -d --force-recreate --no-deps wa-bridge
+            docker image prune -f
+            echo "✅ WA Bridge DEV desplegado: $(date '+%Y-%m-%d %H:%M:%S')"
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 3b: Deploy → QA  (rama qa)
+  # ──────────────────────────────────────────────────────────────
+  deploy-qa:
+    name: Deploy → QA
+    needs: docker
+    if: >
+      needs.docker.result == 'success' &&
+      (
+        (github.event_name == 'push' && github.ref_name == 'qa') ||
+        (github.event_name == 'workflow_dispatch' && inputs.environment == 'qa')
+      )
+    runs-on: ubuntu-latest
+    environment: qa
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            echo "→ Deploy WA Bridge [qa] en QA"
+            cd /root/qa
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker compose pull wa-bridge
+            docker compose up -d --force-recreate --no-deps wa-bridge
+            docker image prune -f
+            echo "✅ WA Bridge QA desplegado: $(date '+%Y-%m-%d %H:%M:%S')"
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 3c: Deploy → PRODUCCIÓN  (rama main)
+  # ──────────────────────────────────────────────────────────────
+  deploy-prod:
+    name: Deploy → PRODUCCIÓN
+    needs: docker
+    if: >
+      needs.docker.result == 'success' &&
+      (
+        (github.event_name == 'push' && github.ref_name == 'main') ||
+        (github.event_name == 'workflow_dispatch' && inputs.environment == 'prod')
+      )
+    runs-on: ubuntu-latest
+    environment: production   # ← requiere aprobación manual en GitHub
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            echo "→ Deploy WA Bridge [main] en PRODUCCIÓN"
+            cd /root/prod
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker compose pull wa-bridge
+            docker compose up -d --force-recreate --no-deps wa-bridge
+            docker image prune -f
+            echo "✅ WA Bridge PRODUCCIÓN desplegado: $(date '+%Y-%m-%d %H:%M:%S')"
