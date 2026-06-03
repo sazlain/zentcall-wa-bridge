@@ -507,6 +507,66 @@ async function processMessage(
   await forwardMessage(adminId, fromPhone, toPhone, body ?? '', direction, wamid, timestamp, media)
 }
 
+// ── Helpers de envío ─────────────────────────────────────────────────────────
+
+/**
+ * Resuelve el JID correcto para enviar un mensaje a `cleanPhone`.
+ *
+ * Prioridad:
+ * 1. LID ya mapeado en memoria (lidToPhone).
+ * 2. Consulta `sock.onWhatsApp(phone)` → WA devuelve el JID canónico del
+ *    contacto. Para usuarios con privacidad avanzada devuelve `<lid>@lid`;
+ *    esto nos da el mapeo y garantiza entrega E2E correcta.
+ * 3. Fallback a `<phone>@s.whatsapp.net`.
+ *
+ * El resultado se persiste en lid-map.json para sesiones futuras.
+ */
+async function resolveJid(
+  adminId:    number,
+  cleanPhone: string,
+  sock:       WASocket,
+): Promise<string> {
+  const map = lidToPhone.get(adminId)
+
+  // 1. LID ya en caché (exacto o por sufijo)
+  const cachedLid = map?.get(cleanPhone)
+    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
+    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
+
+  if (cachedLid && cachedLid !== cleanPhone && cachedLid.length >= 13) {
+    return `${cachedLid}@lid`
+  }
+
+  // 2. Consultar WA para obtener JID canónico (puede ser @lid)
+  try {
+    const results = await sock.onWhatsApp(cleanPhone)
+    const found   = results?.[0]
+    if (found?.exists && found.jid) {
+      const canonical = found.jid
+      const lidNum    = canonical.replace(/@.+/, '').replace(/:.*/, '')
+
+      if (canonical.endsWith('@lid') && lidNum !== cleanPhone) {
+        // Nuevo mapeo: persistir bidireccional
+        const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
+        cMap.set(lidNum,    cleanPhone)
+        cMap.set(cleanPhone, lidNum)
+        lidToPhone.set(adminId, cMap)
+        saveLidMap(adminId, cMap)
+        logger.info({ adminId, phone: cleanPhone, lid: lidNum }, 'LID discovered via onWhatsApp — cached')
+        return `${lidNum}@lid`
+      }
+
+      // WA devolvió JID de teléfono normal
+      return canonical
+    }
+  } catch (err) {
+    logger.warn({ adminId, phone: cleanPhone, err }, 'onWhatsApp lookup failed — using phone JID')
+  }
+
+  // 3. Fallback
+  return `${cleanPhone}@s.whatsapp.net`
+}
+
 // ── API pública del manager ───────────────────────────────────────────────────
 
 export async function stopSession(adminId: number): Promise<void> {
@@ -559,24 +619,9 @@ export async function sendTextMessage(
   }
 
   const cleanPhone = toPhone.replace(/\D/g, '')
+  const jid        = await resolveJid(adminId, cleanPhone, state.socket)
 
-  /**
-   * Preferir el LID cuando esté disponible.
-   * Si el contacto recibió con @lid, Baileys tiene la sesión E2E establecida
-   * para ese JID. Enviar al mismo LID usa esa sesión y el mensaje llega.
-   * Fallback a @s.whatsapp.net cuando no hay LID mapeado.
-   *
-   * Búsqueda: exacta primero, luego sufijo nacional (maneja código de país).
-   */
-  const map  = lidToPhone.get(adminId)
-  const lid  = map?.get(cleanPhone)
-    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
-    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
-
-  const useLid = lid && lid !== cleanPhone && lid.length >= 13
-  const jid    = useLid ? `${lid}@lid` : `${cleanPhone}@s.whatsapp.net`
-
-  logger.info({ adminId, toPhone: cleanPhone, lid: lid ?? null, jid }, 'Sending WA message')
+  logger.info({ adminId, toPhone: cleanPhone, jid }, 'Sending WA message')
 
   const result = await state.socket.sendMessage(jid, { text })
   const wamid  = result?.key?.id ?? ''
@@ -606,16 +651,9 @@ export async function sendMediaMessage(
   }
 
   const cleanPhone = toPhone.replace(/\D/g, '')
+  const jid        = await resolveJid(adminId, cleanPhone, state.socket)
 
-  const map  = lidToPhone.get(adminId)
-  const lid  = map?.get(cleanPhone)
-    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
-    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
-
-  const useLid = lid && lid !== cleanPhone && lid.length >= 13
-  const jid    = useLid ? `${lid}@lid` : `${cleanPhone}@s.whatsapp.net`
-
-  logger.info({ adminId, toPhone: cleanPhone, lid: lid ?? null, jid, mediaType }, 'Sending WA media')
+  logger.info({ adminId, toPhone: cleanPhone, jid, mediaType }, 'Sending WA media')
 
   const buf = Buffer.from(mediaBase64, 'base64')
   let content: any
