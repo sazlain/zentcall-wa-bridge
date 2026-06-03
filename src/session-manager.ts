@@ -20,6 +20,27 @@ const BACKEND_URL  = process.env.BACKEND_URL  ?? 'http://localhost:8080'
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET ?? 'change-me'
 const SESSIONS_DIR  = process.env.SESSIONS_DIR  ?? './sessions'
 
+// ── Helpers de detección de error LID ───────────────────────────────────────
+
+/**
+ * Devuelve true si el error de Baileys indica que WhatsApp rechazó el mensaje
+ * porque el destinatario tiene privacidad avanzada (LID) activa.
+ * El código de error WA es 463 y se propaga como Boom o como Error genérico.
+ */
+function isLidError(err: any): boolean {
+  // Boom error de Baileys con statusCode = 463
+  if (err?.output?.statusCode === 463) return true
+  // Error genérico cuyo mensaje contiene el código 463
+  const msg = String(err?.message ?? '')
+  if (/\b463\b/.test(msg)) return true
+  // Estructura de datos de error WA dentro de err.data.content
+  const content = (err as any)?.data?.content
+  if (Array.isArray(content)) {
+    return content.some((c: any) => String(c?.attrs?.code) === '463')
+  }
+  return false
+}
+
 // ── Estado en memoria de cada sesión ─────────────────────────────────────────
 
 type SessionStatus = 'disconnected' | 'connecting' | 'qr' | 'connected'
@@ -48,6 +69,59 @@ const lidToPhone = new Map<number, Map<string, string>>()
  * el echo puede tener remoteJid=LID@lid pero el wamid coincide con el envío.
  */
 const pendingOutbound = new Map<number, Map<string, string>>() // adminId → (wamid → toPhone)
+
+/**
+ * Cola de mensajes que fallaron con error 463 (contacto con privacidad LID activa).
+ * Clave: `${adminId}:${cleanPhone}`.  Valor: array de contenidos pendientes.
+ * Se re-intentan automáticamente cuando se descubre el LID real del contacto
+ * (esto ocurre en el primer mensaje inbound de ese contacto).
+ */
+const pendingSends = new Map<string, Array<{content: any; addedAt: number}>>()
+
+/** Elimina entradas expiradas (>1 h) de la cola pendingSends para una clave. */
+function evictPendingSend(key: string): void {
+  const queue = pendingSends.get(key)
+  if (!queue) return
+  const fresh = queue.filter(p => Date.now() - p.addedAt < 3_600_000)
+  if (fresh.length === 0) pendingSends.delete(key)
+  else                    pendingSends.set(key, fresh)
+}
+
+/**
+ * Cuando se descubre un nuevo mapeo LID↔teléfono, re-intenta todos los mensajes
+ * que estaban en cola para ese teléfono (enviados mientras el LID era desconocido).
+ * El echo del re-intento se registra en pendingOutbound para que no genere
+ * un mensaje duplicado en call-monitor.
+ */
+async function checkAndRetryPending(adminId: number, phone: string, lid: string): Promise<void> {
+  const key = `${adminId}:${phone}`
+  const pending = pendingSends.get(key)
+  if (!pending?.length) return
+
+  const state = sessions.get(adminId)
+  if (!state?.socket || state.status !== 'connected') return
+
+  pendingSends.delete(key)
+  const lidJid = `${lid}@lid`
+  logger.info({ adminId, phone, lid, count: pending.length },
+    'Auto-retry: enviando mensajes en cola tras descubrir LID')
+
+  for (const p of pending) {
+    try {
+      const retryResult = await state.socket.sendMessage(lidJid, p.content)
+      const wamid       = retryResult?.key?.id ?? ''
+      if (wamid) {
+        // Registrar wamid para deduplicar el echo (el mensaje ya está guardado en DB)
+        if (!pendingOutbound.has(adminId)) pendingOutbound.set(adminId, new Map())
+        pendingOutbound.get(adminId)!.set(wamid, phone)
+        setTimeout(() => pendingOutbound.get(adminId)?.delete(wamid), 60_000)
+      }
+      logger.info({ adminId, phone, lid, wamid }, 'Mensaje en cola entregado exitosamente (LID auto-resuelto)')
+    } catch (err) {
+      logger.error({ adminId, phone, lid, err }, 'Error al re-intentar mensaje en cola')
+    }
+  }
+}
 
 /**
  * Todos los contactos recibidos desde Baileys (cualquier evento) por sesión.
@@ -258,6 +332,8 @@ export async function startSession(adminId: number): Promise<void> {
           contacts.set(phoneRaw, lidRaw)    // inverso
           logger.info({ adminId, lid: lidRaw, phone: phoneRaw }, 'LID mapped')
           changed = true
+          // Re-intentar mensajes que fallaron con error 463 para este teléfono
+          ;(async () => { await checkAndRetryPending(adminId, phoneRaw, lidRaw) })()
         }
       }
     }
@@ -444,6 +520,9 @@ async function processMessage(
             cMap.set(resolved, remote)
             saveLidMap(adminId, cMap)
             logger.info({ adminId, lid: remote, phone: resolved }, 'Resolved LID from allContacts fallback')
+            // Re-intentar mensajes en cola para este teléfono
+            const lidForRetry = remote
+            ;(async () => { await checkAndRetryPending(adminId, resolved!, lidForRetry) })()
             break
           }
         }
@@ -467,6 +546,9 @@ async function processMessage(
             // Poblar allContacts también para futuras búsquedas
             allContacts.get(adminId)?.set(c.id, c)
             logger.info({ adminId, lid: remote, phone: resolvedPhone }, 'Resolved LID from sock.contacts (last resort)')
+            // Re-intentar mensajes en cola para este teléfono
+            const lidForRetry2 = remote
+            ;(async () => { await checkAndRetryPending(adminId, resolvedPhone, lidForRetry2) })()
             resolved = resolvedPhone
             break
           }
@@ -623,7 +705,26 @@ export async function sendTextMessage(
 
   logger.info({ adminId, toPhone: cleanPhone, jid }, 'Sending WA message')
 
-  const result = await state.socket.sendMessage(jid, { text })
+  let result: Awaited<ReturnType<typeof state.socket.sendMessage>>
+  try {
+    result = await state.socket.sendMessage(jid, { text })
+  } catch (err: any) {
+    if (isLidError(err)) {
+      // Contacto con privacidad avanzada WA (LID). El JID @s.whatsapp.net es rechazado.
+      // Guardamos el mensaje en cola: se re-enviará automáticamente cuando llegue
+      // el primer inbound del contacto (que revela su LID real).
+      const key = `${adminId}:${cleanPhone}`
+      if (!pendingSends.has(key)) pendingSends.set(key, [])
+      pendingSends.get(key)!.push({ content: { text }, addedAt: Date.now() })
+      // Limpiar la cola después de 1 hora si no se resolvió
+      setTimeout(() => evictPendingSend(key), 3_600_000)
+      logger.warn({ adminId, phone: cleanPhone },
+        'WA error 463 — mensaje en cola LID; se re-enviará cuando el contacto escriba')
+      return { wamid: '' }  // Sin error: call-monitor guarda como SENT (wamid vacío)
+    }
+    throw err
+  }
+
   const wamid  = result?.key?.id ?? ''
 
   // Registrar wamid → toPhone para deduplicar el echo saliente
@@ -665,8 +766,23 @@ export async function sendMediaMessage(
     content = { document: buf, mimetype, caption: caption ?? '', fileName: 'archivo' }
   }
 
-  const result = await state.socket.sendMessage(jid, content)
-  const wamid  = result?.key?.id ?? ''
+  let result2: Awaited<ReturnType<typeof state.socket.sendMessage>>
+  try {
+    result2 = await state.socket.sendMessage(jid, content)
+  } catch (err: any) {
+    if (isLidError(err)) {
+      const key = `${adminId}:${cleanPhone}`
+      if (!pendingSends.has(key)) pendingSends.set(key, [])
+      pendingSends.get(key)!.push({ content, addedAt: Date.now() })
+      setTimeout(() => evictPendingSend(key), 3_600_000)
+      logger.warn({ adminId, phone: cleanPhone, mediaType },
+        'WA error 463 — media en cola LID; se re-enviará cuando el contacto escriba')
+      return { wamid: '' }
+    }
+    throw err
+  }
+
+  const wamid  = result2?.key?.id ?? ''
 
   if (wamid) {
     if (!pendingOutbound.has(adminId)) pendingOutbound.set(adminId, new Map())
