@@ -265,17 +265,20 @@ export async function startSession(adminId: number): Promise<void> {
   }
 
   /**
-   * contacts.upsert — actualizaciones individuales de contactos.
+   * contacts.upsert — contactos nuevos/actualizados individualmente.
    * contacts.update — cambios en contactos existentes.
-   * messaging-history.set — sync inicial: contiene la lista completa de contactos
-   *   con sus LIDs; es la fuente más fiable al reconectar.
+   * messaging-history.set — sync inicial; trae la lista COMPLETA de contactos
+   *   con sus LIDs (fuente más fiable en Baileys 6.7.x).
    */
-  sock.ev.on('contacts.upsert',  indexContacts)
-  sock.ev.on('contacts.update',  indexContacts)
+  sock.ev.on('contacts.upsert', indexContacts)
+  sock.ev.on('contacts.update', indexContacts)
   sock.ev.on('messaging-history.set', ({ contacts: histContacts }) => {
     if (histContacts?.length) {
       logger.info({ adminId, count: histContacts.length }, 'Indexing contacts from history sync')
       indexContacts(histContacts)
+      // Leer también sock.contacts porque Baileys los habrá mergeado ya
+      const cached = Object.values((sock as any).contacts ?? {}) as any[]
+      if (cached.length) indexContacts(cached)
     }
   })
 
@@ -296,6 +299,13 @@ export async function startSession(adminId: number): Promise<void> {
       state.phone  = phone
       logger.info({ adminId, phone }, 'WhatsApp session connected')
       await notifyStatus(adminId, 'connected', phone)
+
+      // Leer el caché interno de Baileys; puede incluir .lid de sesiones previas
+      const cached = Object.values((sock as any).contacts ?? {}) as any[]
+      if (cached.length > 0) {
+        logger.info({ adminId, count: cached.length }, 'Indexing contacts from internal cache on connect')
+        indexContacts(cached)
+      }
     }
 
     if (connection === 'close') {
@@ -442,7 +452,30 @@ async function processMessage(
       if (resolved) {
         remote = resolved
       } else {
-        logger.warn({ adminId, jid: remoteJid, lid: remote }, 'LID not resolved — forwarding LID as-is')
+        // Último recurso: escanear sock.contacts directamente (cache interno de Baileys)
+        const sockContacts = Object.values((sock as any).contacts ?? {}) as any[]
+        for (const c of sockContacts) {
+          if (!c.id || c.id.endsWith('@lid') || c.id.endsWith('@g.us')) continue
+          const cLid = c.lid as string | undefined
+          if (cLid && (cLid === remoteJid || cLid.replace(/@.+/, '') === remote)) {
+            const resolvedPhone: string = c.id.replace(/@.+/, '').replace(/:.*/, '')
+            const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
+            cMap.set(remote, resolvedPhone)
+            cMap.set(resolvedPhone, remote)
+            lidToPhone.set(adminId, cMap)
+            saveLidMap(adminId, cMap)
+            // Poblar allContacts también para futuras búsquedas
+            allContacts.get(adminId)?.set(c.id, c)
+            logger.info({ adminId, lid: remote, phone: resolvedPhone }, 'Resolved LID from sock.contacts (last resort)')
+            resolved = resolvedPhone
+            break
+          }
+        }
+        if (resolved) {
+          remote = resolved
+        } else {
+          logger.warn({ adminId, jid: remoteJid, lid: remote }, 'LID not resolved — forwarding LID as-is')
+        }
       }
     }
   }
@@ -472,6 +505,66 @@ async function processMessage(
   }
 
   await forwardMessage(adminId, fromPhone, toPhone, body ?? '', direction, wamid, timestamp, media)
+}
+
+// ── Helpers de envío ─────────────────────────────────────────────────────────
+
+/**
+ * Resuelve el JID correcto para enviar un mensaje a `cleanPhone`.
+ *
+ * Prioridad:
+ * 1. LID ya mapeado en memoria (lidToPhone).
+ * 2. Consulta `sock.onWhatsApp(phone)` → WA devuelve el JID canónico del
+ *    contacto. Para usuarios con privacidad avanzada devuelve `<lid>@lid`;
+ *    esto nos da el mapeo y garantiza entrega E2E correcta.
+ * 3. Fallback a `<phone>@s.whatsapp.net`.
+ *
+ * El resultado se persiste en lid-map.json para sesiones futuras.
+ */
+async function resolveJid(
+  adminId:    number,
+  cleanPhone: string,
+  sock:       WASocket,
+): Promise<string> {
+  const map = lidToPhone.get(adminId)
+
+  // 1. LID ya en caché (exacto o por sufijo)
+  const cachedLid = map?.get(cleanPhone)
+    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
+    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
+
+  if (cachedLid && cachedLid !== cleanPhone && cachedLid.length >= 13) {
+    return `${cachedLid}@lid`
+  }
+
+  // 2. Consultar WA para obtener JID canónico (puede ser @lid)
+  try {
+    const results = await sock.onWhatsApp(cleanPhone)
+    const found   = results?.[0]
+    if (found?.exists && found.jid) {
+      const canonical = found.jid
+      const lidNum    = canonical.replace(/@.+/, '').replace(/:.*/, '')
+
+      if (canonical.endsWith('@lid') && lidNum !== cleanPhone) {
+        // Nuevo mapeo: persistir bidireccional
+        const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
+        cMap.set(lidNum,    cleanPhone)
+        cMap.set(cleanPhone, lidNum)
+        lidToPhone.set(adminId, cMap)
+        saveLidMap(adminId, cMap)
+        logger.info({ adminId, phone: cleanPhone, lid: lidNum }, 'LID discovered via onWhatsApp — cached')
+        return `${lidNum}@lid`
+      }
+
+      // WA devolvió JID de teléfono normal
+      return canonical
+    }
+  } catch (err) {
+    logger.warn({ adminId, phone: cleanPhone, err }, 'onWhatsApp lookup failed — using phone JID')
+  }
+
+  // 3. Fallback
+  return `${cleanPhone}@s.whatsapp.net`
 }
 
 // ── API pública del manager ───────────────────────────────────────────────────
@@ -526,24 +619,9 @@ export async function sendTextMessage(
   }
 
   const cleanPhone = toPhone.replace(/\D/g, '')
+  const jid        = await resolveJid(adminId, cleanPhone, state.socket)
 
-  /**
-   * Preferir el LID cuando esté disponible.
-   * Si el contacto recibió con @lid, Baileys tiene la sesión E2E establecida
-   * para ese JID. Enviar al mismo LID usa esa sesión y el mensaje llega.
-   * Fallback a @s.whatsapp.net cuando no hay LID mapeado.
-   *
-   * Búsqueda: exacta primero, luego sufijo nacional (maneja código de país).
-   */
-  const map  = lidToPhone.get(adminId)
-  const lid  = map?.get(cleanPhone)
-    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
-    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
-
-  const useLid = lid && lid !== cleanPhone && lid.length >= 13
-  const jid    = useLid ? `${lid}@lid` : `${cleanPhone}@s.whatsapp.net`
-
-  logger.info({ adminId, toPhone: cleanPhone, lid: lid ?? null, jid }, 'Sending WA message')
+  logger.info({ adminId, toPhone: cleanPhone, jid }, 'Sending WA message')
 
   const result = await state.socket.sendMessage(jid, { text })
   const wamid  = result?.key?.id ?? ''
@@ -573,16 +651,9 @@ export async function sendMediaMessage(
   }
 
   const cleanPhone = toPhone.replace(/\D/g, '')
+  const jid        = await resolveJid(adminId, cleanPhone, state.socket)
 
-  const map  = lidToPhone.get(adminId)
-  const lid  = map?.get(cleanPhone)
-    ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
-    ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
-
-  const useLid = lid && lid !== cleanPhone && lid.length >= 13
-  const jid    = useLid ? `${lid}@lid` : `${cleanPhone}@s.whatsapp.net`
-
-  logger.info({ adminId, toPhone: cleanPhone, lid: lid ?? null, jid, mediaType }, 'Sending WA media')
+  logger.info({ adminId, toPhone: cleanPhone, jid, mediaType }, 'Sending WA media')
 
   const buf = Buffer.from(mediaBase64, 'base64')
   let content: any
