@@ -265,26 +265,20 @@ export async function startSession(adminId: number): Promise<void> {
   }
 
   /**
-   * contacts.set  — lista COMPLETA de contactos enviada por WA al sincronizar;
-   *                 es la fuente más fiable (incluye campo .lid).
    * contacts.upsert — contactos nuevos/actualizados individualmente.
    * contacts.update — cambios en contactos existentes.
-   * messaging-history.set — historial inicial; puede traer contactos adicionales.
+   * messaging-history.set — sync inicial; trae la lista COMPLETA de contactos
+   *   con sus LIDs (fuente más fiable en Baileys 6.7.x).
    */
-  sock.ev.on('contacts.set', ({ contacts: setContacts }) => {
-    const list = setContacts ?? []
-    logger.info({ adminId, count: list.length }, 'contacts.set received — indexing full contact list')
-    if (list.length) indexContacts(list)
-    // Leer también sock.contacts porque Baileys ya los habrá mergeado
-    const cached = Object.values((sock as any).contacts ?? {}) as any[]
-    if (cached.length) indexContacts(cached)
-  })
-  sock.ev.on('contacts.upsert',  indexContacts)
-  sock.ev.on('contacts.update',  indexContacts)
+  sock.ev.on('contacts.upsert', indexContacts)
+  sock.ev.on('contacts.update', indexContacts)
   sock.ev.on('messaging-history.set', ({ contacts: histContacts }) => {
     if (histContacts?.length) {
       logger.info({ adminId, count: histContacts.length }, 'Indexing contacts from history sync')
       indexContacts(histContacts)
+      // Leer también sock.contacts porque Baileys los habrá mergeado ya
+      const cached = Object.values((sock as any).contacts ?? {}) as any[]
+      if (cached.length) indexContacts(cached)
     }
   })
 
@@ -464,15 +458,16 @@ async function processMessage(
           if (!c.id || c.id.endsWith('@lid') || c.id.endsWith('@g.us')) continue
           const cLid = c.lid as string | undefined
           if (cLid && (cLid === remoteJid || cLid.replace(/@.+/, '') === remote)) {
-            resolved = c.id.replace(/@.+/, '').replace(/:.*/, '')
+            const resolvedPhone: string = c.id.replace(/@.+/, '').replace(/:.*/, '')
             const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
-            cMap.set(remote, resolved)
-            cMap.set(resolved, remote)
+            cMap.set(remote, resolvedPhone)
+            cMap.set(resolvedPhone, remote)
             lidToPhone.set(adminId, cMap)
             saveLidMap(adminId, cMap)
             // Poblar allContacts también para futuras búsquedas
             allContacts.get(adminId)?.set(c.id, c)
-            logger.info({ adminId, lid: remote, phone: resolved }, 'Resolved LID from sock.contacts (last resort)')
+            logger.info({ adminId, lid: remote, phone: resolvedPhone }, 'Resolved LID from sock.contacts (last resort)')
+            resolved = resolvedPhone
             break
           }
         }
