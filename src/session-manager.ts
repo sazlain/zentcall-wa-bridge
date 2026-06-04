@@ -78,6 +78,16 @@ const pendingOutbound = new Map<number, Map<string, string>>() // adminId → (w
  */
 const pendingSends = new Map<string, Array<{content: any; addedAt: number}>>()
 
+/**
+ * JID completo (con número de dispositivo) capturado del último inbound de cada contacto LID.
+ * Clave: `${adminId}:${phone}`.  Valor: JID completo, ej: "187106055983173:2@lid".
+ *
+ * Cuando enviamos usando este JID (en lugar del bare "187106055983173@lid"), Baileys
+ * reutiliza la sesión Signal ya establecida desde el inbound, evitando el getUSyncDevices
+ * que falla para contactos con privacidad avanzada.
+ */
+const fullLidJids = new Map<string, string>() // "adminId:phone" → JID completo
+
 /** Elimina entradas expiradas (>1 h) de la cola pendingSends para una clave. */
 function evictPendingSend(key: string): void {
   const queue = pendingSends.get(key)
@@ -102,8 +112,9 @@ async function checkAndRetryPending(adminId: number, phone: string, lid: string)
   if (!state?.socket || state.status !== 'connected') return
 
   pendingSends.delete(key)
-  const lidJid = `${lid}@lid`
-  logger.info({ adminId, phone, lid, count: pending.length },
+  // Preferir JID completo (con device) si está disponible
+  const lidJid = fullLidJids.get(key) ?? `${lid}@lid`
+  logger.info({ adminId, phone, lid, lidJid, count: pending.length },
     'Auto-retry: enviando mensajes en cola tras descubrir LID')
 
   for (const p of pending) {
@@ -504,8 +515,17 @@ async function processMessage(
     }
 
     if (resolved) {
-      logger.info({ adminId, lid: remote, phone: resolved }, 'Resolved LID to real phone')
+      logger.info({ adminId, lid: remote, phone: resolved, remoteJid }, 'Resolved LID to real phone')
       remote = resolved
+      // Guardar JID completo (con device number) para usar en replies.
+      // Usando este JID Baileys reutiliza la sesión Signal existente del inbound
+      // en lugar de hacer getUSyncDevices (que falla para contactos LID por privacidad).
+      const fullKey = `${adminId}:${resolved}`
+      if (fullLidJids.get(fullKey) !== remoteJid) {
+        fullLidJids.set(fullKey, remoteJid)
+        logger.info({ adminId, phone: resolved, fullJid: remoteJid },
+          'Full LID JID stored from inbound — will use for outbound replies')
+      }
     } else {
       // Fallback: buscar en allContacts un contacto cuyo .lid coincida
       const sessionAllContacts = allContacts.get(adminId)
@@ -608,6 +628,17 @@ async function resolveJid(
   cleanPhone: string,
   sock:       WASocket,
 ): Promise<string> {
+  // 0. JID completo (con device number) capturado del último inbound.
+  //    Usar esto permite a Baileys reutilizar la sesión Signal ya establecida
+  //    en lugar de llamar getUSyncDevices (que falla para contactos @lid por privacidad).
+  const fullKey = `${adminId}:${cleanPhone}`
+  const storedFullJid = fullLidJids.get(fullKey)
+  if (storedFullJid) {
+    logger.info({ adminId, phone: cleanPhone, jid: storedFullJid },
+      'Using full LID JID from inbound session for outbound reply')
+    return storedFullJid
+  }
+
   const map = lidToPhone.get(adminId)
 
   // 1. LID ya en caché (exacto o por sufijo)
