@@ -614,14 +614,20 @@ async function processMessage(
 /**
  * Resuelve el JID correcto para enviar un mensaje a `cleanPhone`.
  *
- * Prioridad:
- * 1. LID ya mapeado en memoria (lidToPhone).
- * 2. Consulta `sock.onWhatsApp(phone)` → WA devuelve el JID canónico del
- *    contacto. Para usuarios con privacidad avanzada devuelve `<lid>@lid`;
- *    esto nos da el mapeo y garantiza entrega E2E correcta.
- * 3. Fallback a `<phone>@s.whatsapp.net`.
+ * REGLA FUNDAMENTAL:
+ * - `found.lid` de onWhatsApp() existe para TODOS los contactos WA (es un ID interno,
+ *   NO indica que tengan WA Advanced Privacy activa).
+ * - Usar `@lid` para outbound solo cuando WA lo exige explícitamente:
+ *   a) `found.jid` devuelve `@lid` como JID canónico
+ *   b) El envío a `@s.whatsapp.net` lanzó error 463 (capturado en sendTextMessage)
+ *      y se guardó el LID bidireccional en lidToPhone vía indexContacts/addOrEditContact
  *
- * El resultado se persiste en lid-map.json para sesiones futuras.
+ * Prioridad de resolución:
+ * 0. JID completo del último inbound (device-specific, reutiliza sesión Signal)
+ * 1. Cache lidToPhone (phone→lid): SOLO para contactos con LID privacy confirmado
+ * 2. onWhatsApp() → solo usa @lid si found.jid lo retorna explícitamente
+ *    → found.lid se cachea solo LID→phone (para inbound), no phone→lid
+ * 3. Fallback a @s.whatsapp.net
  */
 async function resolveJid(
   adminId:    number,
@@ -629,8 +635,7 @@ async function resolveJid(
   sock:       WASocket,
 ): Promise<string> {
   // 0. JID completo (con device number) capturado del último inbound.
-  //    Usar esto permite a Baileys reutilizar la sesión Signal ya establecida
-  //    en lugar de llamar getUSyncDevices (que falla para contactos @lid por privacidad).
+  //    Baileys reutiliza la sesión Signal establecida sin llamar getUSyncDevices.
   const fullKey = `${adminId}:${cleanPhone}`
   const storedFullJid = fullLidJids.get(fullKey)
   if (storedFullJid) {
@@ -641,56 +646,59 @@ async function resolveJid(
 
   const map = lidToPhone.get(adminId)
 
-  // 1. LID ya en caché (exacto o por sufijo)
+  // 1. LID confirmado en caché (solo se escribe bidireccional para contactos
+  //    donde @s.whatsapp.net ya falló o found.jid fue @lid)
   const cachedLid = map?.get(cleanPhone)
     ?? (cleanPhone.length > 10 ? map?.get(cleanPhone.slice(-10)) : undefined)
     ?? (cleanPhone.length > 11 ? map?.get(cleanPhone.slice(-11)) : undefined)
 
   if (cachedLid && cachedLid !== cleanPhone && cachedLid.length >= 13) {
+    logger.info({ adminId, phone: cleanPhone, lid: cachedLid },
+      'Using confirmed LID from cache for outbound')
     return `${cachedLid}@lid`
   }
 
-  // 2. Consultar WA para obtener JID canónico (puede ser @lid)
+  // 2. Consultar WA para obtener JID canónico
   try {
     const results = await sock.onWhatsApp(cleanPhone)
-    logger.debug({ adminId, phone: cleanPhone, result: results }, 'onWhatsApp() result for LID inspection')
+    logger.debug({ adminId, phone: cleanPhone, result: results }, 'onWhatsApp() result')
     const found   = results?.[0]
     if (found?.exists) {
-      // Campo 'lid' separado que Baileys expone en el resultado de onWhatsApp().
-      // WA lo retorna cuando el contacto tiene privacidad avanzada activa.
+      // Cachear found.lid SOLO para resolución de inbound (LID→phone, no phone→LID).
+      // found.lid existe para TODOS los contactos WA — no indica privacidad LID.
+      // No se usa para seleccionar @lid como JID de outbound.
       const lidVal = (found as any).lid
       if (lidVal) {
         const lidNum = String(lidVal).replace(/@.+/, '').replace(/:.*/, '')
         if (lidNum && lidNum !== cleanPhone && lidNum.length >= 10) {
           const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
-          cMap.set(lidNum,     cleanPhone)
-          cMap.set(cleanPhone, lidNum)
-          lidToPhone.set(adminId, cMap)
-          saveLidMap(adminId, cMap)
-          logger.info({ adminId, phone: cleanPhone, lid: lidNum },
-            'LID discovered via onWhatsApp().lid field — cached')
-          ;(async () => { await checkAndRetryPending(adminId, cleanPhone, lidNum) })()
-          return `${lidNum}@lid`
+          if (!cMap.has(lidNum)) {
+            cMap.set(lidNum, cleanPhone) // LID→phone únicamente (para inbound)
+            lidToPhone.set(adminId, cMap)
+            logger.info({ adminId, phone: cleanPhone, lid: lidNum },
+              'LID cached for inbound resolution only (not forcing @lid outbound)')
+          }
         }
       }
 
-      // Fallback: revisar si el jid canónico ya es @lid
       if (found.jid) {
         const canonical = found.jid
         const lidNum    = canonical.replace(/@.+/, '').replace(/:.*/, '')
 
         if (canonical.endsWith('@lid') && lidNum !== cleanPhone) {
+          // WA retorna explícitamente @lid como JID canónico → contacto con LID privacy
           const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
           cMap.set(lidNum,     cleanPhone)
-          cMap.set(cleanPhone, lidNum)
+          cMap.set(cleanPhone, lidNum) // Bidireccional: confirmado que necesita @lid
           lidToPhone.set(adminId, cMap)
           saveLidMap(adminId, cMap)
-          logger.info({ adminId, phone: cleanPhone, lid: lidNum }, 'LID discovered via onWhatsApp().jid — cached')
+          logger.info({ adminId, phone: cleanPhone, lid: lidNum },
+            'LID privacy confirmed via onWhatsApp().jid — using @lid for outbound')
           ;(async () => { await checkAndRetryPending(adminId, cleanPhone, lidNum) })()
-          return `${lidNum}@lid`
+          return canonical
         }
 
-        // WA devolvió JID de teléfono normal
+        // WA retornó JID de teléfono normal → usar @s.whatsapp.net
         return canonical
       }
     }
