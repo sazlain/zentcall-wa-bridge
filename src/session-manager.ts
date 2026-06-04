@@ -622,24 +622,46 @@ async function resolveJid(
   // 2. Consultar WA para obtener JID canónico (puede ser @lid)
   try {
     const results = await sock.onWhatsApp(cleanPhone)
+    logger.debug({ adminId, phone: cleanPhone, result: results }, 'onWhatsApp() result for LID inspection')
     const found   = results?.[0]
-    if (found?.exists && found.jid) {
-      const canonical = found.jid
-      const lidNum    = canonical.replace(/@.+/, '').replace(/:.*/, '')
-
-      if (canonical.endsWith('@lid') && lidNum !== cleanPhone) {
-        // Nuevo mapeo: persistir bidireccional
-        const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
-        cMap.set(lidNum,    cleanPhone)
-        cMap.set(cleanPhone, lidNum)
-        lidToPhone.set(adminId, cMap)
-        saveLidMap(adminId, cMap)
-        logger.info({ adminId, phone: cleanPhone, lid: lidNum }, 'LID discovered via onWhatsApp — cached')
-        return `${lidNum}@lid`
+    if (found?.exists) {
+      // Campo 'lid' separado que Baileys expone en el resultado de onWhatsApp().
+      // WA lo retorna cuando el contacto tiene privacidad avanzada activa.
+      const lidVal = (found as any).lid
+      if (lidVal) {
+        const lidNum = String(lidVal).replace(/@.+/, '').replace(/:.*/, '')
+        if (lidNum && lidNum !== cleanPhone && lidNum.length >= 10) {
+          const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
+          cMap.set(lidNum,     cleanPhone)
+          cMap.set(cleanPhone, lidNum)
+          lidToPhone.set(adminId, cMap)
+          saveLidMap(adminId, cMap)
+          logger.info({ adminId, phone: cleanPhone, lid: lidNum },
+            'LID discovered via onWhatsApp().lid field — cached')
+          ;(async () => { await checkAndRetryPending(adminId, cleanPhone, lidNum) })()
+          return `${lidNum}@lid`
+        }
       }
 
-      // WA devolvió JID de teléfono normal
-      return canonical
+      // Fallback: revisar si el jid canónico ya es @lid
+      if (found.jid) {
+        const canonical = found.jid
+        const lidNum    = canonical.replace(/@.+/, '').replace(/:.*/, '')
+
+        if (canonical.endsWith('@lid') && lidNum !== cleanPhone) {
+          const cMap = lidToPhone.get(adminId) ?? new Map<string, string>()
+          cMap.set(lidNum,     cleanPhone)
+          cMap.set(cleanPhone, lidNum)
+          lidToPhone.set(adminId, cMap)
+          saveLidMap(adminId, cMap)
+          logger.info({ adminId, phone: cleanPhone, lid: lidNum }, 'LID discovered via onWhatsApp().jid — cached')
+          ;(async () => { await checkAndRetryPending(adminId, cleanPhone, lidNum) })()
+          return `${lidNum}@lid`
+        }
+
+        // WA devolvió JID de teléfono normal
+        return canonical
+      }
     }
   } catch (err) {
     logger.warn({ adminId, phone: cleanPhone, err }, 'onWhatsApp lookup failed — using phone JID')
@@ -711,15 +733,28 @@ export async function sendTextMessage(
   } catch (err: any) {
     if (isLidError(err)) {
       // Contacto con privacidad avanzada WA (LID). El JID @s.whatsapp.net es rechazado.
-      // Guardamos el mensaje en cola: se re-enviará automáticamente cuando llegue
-      // el primer inbound del contacto (que revela su LID real).
+      // 1. Guardar en cola para reintento automático.
       const key = `${adminId}:${cleanPhone}`
       if (!pendingSends.has(key)) pendingSends.set(key, [])
       pendingSends.get(key)!.push({ content: { text }, addedAt: Date.now() })
-      // Limpiar la cola después de 1 hora si no se resolvió
       setTimeout(() => evictPendingSend(key), 3_600_000)
+
+      // 2. Guardar el número como contacto en WA para desencadenar contacts.upsert
+      //    con el LID real. indexContacts ya llama checkAndRetryPending automáticamente.
+      try {
+        await state.socket.addOrEditContact(
+          `${cleanPhone}@s.whatsapp.net`,
+          { fullName: cleanPhone },
+        )
+        logger.info({ adminId, phone: cleanPhone },
+          'Contacto guardado en WA — contacts.upsert revelará el LID y reintentará')
+      } catch (contactErr) {
+        logger.warn({ adminId, phone: cleanPhone, err: contactErr },
+          'addOrEditContact falló — se esperará inbound del contacto para descubrir LID')
+      }
+
       logger.warn({ adminId, phone: cleanPhone },
-        'WA error 463 — mensaje en cola LID; se re-enviará cuando el contacto escriba')
+        'WA error 463 — mensaje en cola LID; reintento automático en curso')
       return { wamid: '' }  // Sin error: call-monitor guarda como SENT (wamid vacío)
     }
     throw err
@@ -775,8 +810,21 @@ export async function sendMediaMessage(
       if (!pendingSends.has(key)) pendingSends.set(key, [])
       pendingSends.get(key)!.push({ content, addedAt: Date.now() })
       setTimeout(() => evictPendingSend(key), 3_600_000)
+
+      try {
+        await state.socket.addOrEditContact(
+          `${cleanPhone}@s.whatsapp.net`,
+          { fullName: cleanPhone },
+        )
+        logger.info({ adminId, phone: cleanPhone },
+          'Contacto guardado en WA — contacts.upsert revelará el LID y reintentará')
+      } catch (contactErr) {
+        logger.warn({ adminId, phone: cleanPhone, err: contactErr },
+          'addOrEditContact falló — se esperará inbound del contacto para descubrir LID')
+      }
+
       logger.warn({ adminId, phone: cleanPhone, mediaType },
-        'WA error 463 — media en cola LID; se re-enviará cuando el contacto escriba')
+        'WA error 463 — media en cola LID; reintento automático en curso')
       return { wamid: '' }
     }
     throw err
